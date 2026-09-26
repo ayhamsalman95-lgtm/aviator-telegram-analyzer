@@ -1,0 +1,386 @@
+﻿                  await el.click(timeout=2500, force=True)
+                    await pge.wait_for_timeout(1200)
+
+                    for cp in list(context.pages):
+                        for cf in list(cp.frames):
+                            try:
+                                body = await cf.locator(
+                                    "body"
+                                ).inner_text(timeout=1500)
+                            except Exception:
+                                continue
+
+                            if seed_re.search(body):
+                                print(
+                                    f"[FAIRNESS] SETTINGS VERIFIED "
+                                    f"round={round_id}",
+                                    flush=True
+                                )
+
+                                print(
+                                    f"[FAIRNESS] SETTINGS TEXT "
+                                    f"round={round_id}: "
+                                    f"{body[:4000].replace(chr(10), ' | ')}",
+                                    flush=True
+                                )
+
+                                return True
+
+                except Exception as e:
+                    print(
+                        f"[FAIRNESS] settings error round={round_id}: "
+                        f"{type(e).__name__}: {e}",
+                        flush=True
+                    )
+
+    print(
+        f"[FAIRNESS] Provably Fair Settings not found "
+        f"round={round_id}",
+        flush=True
+    )
+
+    return False
+
+async def _login_needed(page) -> bool:
+    """Best-effort detection of a login page/modal without assuming site selectors."""
+    try:
+        current = (page.url or "").lower()
+        if current.startswith("chrome-error://"):
+            return False
+
+        # A password field is a strong signal that the page is asking for login.
+        if await page.locator("input[type='password']").count() > 0:
+            return True
+
+        # Also catch common login/auth URL paths.
+        if any(marker in current for marker in ("/login", "/signin", "/sign-in", "/auth")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _wait_for_manual_login(page) -> None:
+    """Pause for a manual login in the persistent Chrome profile when required."""
+    if not await _login_needed(page):
+        return
+
+    print("[LOGIN] تسجيل الدخول مطلوب. سجّل الدخول يدويًا داخل نافذة Chrome المفتوحة.", flush=True)
+    print(f"[LOGIN] ستتم المتابعة تلقائيًا بعد نجاح الدخول (مهلة {LOGIN_WAIT_SECONDS} ثانية).", flush=True)
+
+    deadline = time.monotonic() + LOGIN_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2.0)
+        if not await _login_needed(page):
+            print("[LOGIN] تم تجاوز شاشة تسجيل الدخول.", flush=True)
+            return
+
+    raise RuntimeError("انتهت مهلة تسجيل الدخول. سجّل الدخول في Chrome ثم شغّل bot.py مرة أخرى.")
+
+
+async def run() -> None:
+    print(f"[GAME] target={GAME_URL}", flush=True)
+    set_status("starting", "فتح صفحة Aviator المحددة ومراقبة WebSocket وHTTP والإطارات وبيانات العدل...")
+    tracker = RoundTracker()
+
+    async with async_playwright() as p:
+        PROFILE.mkdir(exist_ok=True)
+        try:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE),
+                channel="chrome",
+                headless=False,
+                viewport={"width": 1440, "height": 900},
+                args=["--disable-notifications"],
+            )
+        except Exception as exc:
+            set_status("error", f"تعذر تشغيل Chrome: {exc}")
+            raise
+
+        await context.add_init_script(INJECT_JS)
+        attached_pages: set[int] = set()
+
+        async def on_request(request):
+            try:
+                url = request.url
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "http_request",
+                    "url": safe_url(url),
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "post_data": safe_request_body(request),
+                })
+            except Exception as exc:
+                log_diag({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "source": "http_request_error",
+                    "error": str(exc),
+                })
+
+        async def on_response(response: Response):
+            try:
+                url = response.url
+                ctype = (response.headers.get("content-type") or "").lower()
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "http_response",
+                    "url": safe_url(url),
+                    "status": response.status,
+                    "content_type": ctype,
+                    "resource_type": response.request.resource_type,
+                })
+
+                if not _candidate_response(response):
+                    return
+                if not any(x in ctype for x in ("json", "text/", "javascript", "xml", "html")):
+                    return
+                try:
+                    body = await response.text()
+                except Exception:
+                    return
+
+                truncated = len(body) > MAX_LOG_PAYLOAD
+                body_for_log = body[:MAX_LOG_PAYLOAD]
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "http_response_body",
+                    "url": safe_url(url),
+                    "status": response.status,
+                    "content_type": ctype,
+                    "payload_truncated": truncated,
+                    "payload": body_for_log,
+                })
+
+                tracker.ingest_generic("http_response", url, body_for_log, process_hex=True)
+                if re.search(r"(?i)seed|provably|fair|nonce", body):
+                    log_diag({
+                        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "source": "http_response_candidate",
+                        "url": safe_url(url),
+                        "content_type": ctype,
+                        "length": len(body),
+                        "matched_terms": sorted(set(re.findall(r"(?i)seed|provably|fair|nonce", body))),
+                    })
+            except Exception as exc:
+                print(f"[COLLECTOR] response error: {exc}", flush=True)
+
+        def on_ws(ws):
+            ws_url = ws.url
+            print(f"[WS] OPEN {safe_url(ws_url)}", flush=True)
+            log_network({
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "kind": "websocket_open",
+                "url": safe_url(ws_url),
+            })
+
+            def on_received(payload):
+                b = payload_bytes(payload)
+                if b is not None:
+                    log_network({
+                        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "kind": "websocket_received_binary",
+                        "url": safe_url(ws_url),
+                        "length": len(b),
+                        "preview_hex": binary_preview(b),
+                    })
+                    print(f"[WS] RX BINARY {len(b)} bytes preview={binary_preview(b, 24)}", flush=True)
+                    if SFS_DECODER_AVAILABLE:
+                        try:
+                            obj, consumed = decode_s2c_packet(b)
+                            cmd, params = parse_s2c_command(obj)
+                            print(f"[SFS] RX cmd={cmd!r} consumed={consumed}", flush=True)
+                            log_network({
+                                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "kind": "sfs_decoded",
+                                "url": safe_url(ws_url),
+                                "command": cmd,
+                                "consumed": consumed,
+                                "object": obj,
+                                "params": params,
+                                "object_keys": (
+                                    sorted(str(k) for k in obj.keys())
+                                    if isinstance(obj, dict) else []
+                                ),
+                                "param_keys": (
+                                    sorted(str(k) for k in params.keys())
+                                    if isinstance(params, dict) else []
+                                ),
+                            })
+                            tracker.ingest_sfs_event({
+                                "event_type": str(cmd or "sfs_packet"),
+                                "data": params if params is not None else obj,
+                                "object": obj,
+                            }, ws_url)
+                            return
+                        except Exception as exc:
+                            log_diag({
+                                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "source": "sfs_decode_error",
+                                "url": safe_url(ws_url),
+                                "length": len(b),
+                                "error": str(exc),
+                            })
+                    return
+
+                raw = payload_text(payload)
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "websocket_received",
+                    "url": safe_url(ws_url),
+                    "payload_truncated": len(raw) > MAX_LOG_PAYLOAD,
+                    "payload": raw[:MAX_LOG_PAYLOAD],
+                })
+                tracker.ingest_generic("websocket_received", ws_url, raw, process_hex=True)
+
+            def on_sent(payload):
+                b = payload_bytes(payload)
+                if b is not None:
+                    log_network({
+                        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "kind": "websocket_sent_binary",
+                        "url": safe_url(ws_url),
+                        "length": len(b),
+                        "preview_hex": binary_preview(b),
+                    })
+                    print(f"[WS] TX BINARY {len(b)} bytes preview={binary_preview(b, 24)}", flush=True)
+                    return
+                raw = payload_text(payload)
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "websocket_sent",
+                    "url": safe_url(ws_url),
+                    "payload_truncated": len(raw) > MAX_LOG_PAYLOAD,
+                    "payload": raw[:MAX_LOG_PAYLOAD],
+                })
+                tracker.ingest_generic("websocket_sent", ws_url, raw, process_hex=True)
+
+            ws.on("framereceived", on_received)
+            ws.on("framesent", on_sent)
+            ws.on("socketerror", lambda error: print(f"[WS] ERROR {safe_url(ws_url)}: {error}", flush=True))
+            ws.on("close", lambda _=None: print(f"[WS] CLOSE {safe_url(ws_url)}", flush=True))
+
+        def attach_page(page):
+            pid = id(page)
+            if pid in attached_pages:
+                return
+            attached_pages.add(pid)
+            page.on("websocket", on_ws)
+            page.on("request", lambda request: asyncio.create_task(on_request(request)))
+            page.on("response", lambda response: asyncio.create_task(on_response(response)))
+            page.on("close", lambda _: print("[COLLECTOR] PAGE CLOSED", flush=True))
+
+        for existing in context.pages:
+            attach_page(existing)
+        context.on("page", attach_page)
+
+        page = context.pages[0] if context.pages else await context.new_page()
+        attach_page(page)
+
+        try:
+            # Open the site first so the user can establish the authenticated
+            # session in the persistent Chrome profile.
+            set_status("opening", "فتح الموقع والتحقق من جلسة تسجيل الدخول...")
+            await page.goto(SITE_HOME_URL, wait_until="domcontentloaded", timeout=60000)
+            print(f"[SITE] home={safe_url(page.url)}", flush=True)
+            if page.url.startswith("chrome-error://"):
+                raise RuntimeError("Chrome لم يستطع الوصول إلى الموقع. تحقق من الاتصال أو VPN.")
+
+            await _wait_for_manual_login(page)
+
+            set_status("opening_game", "فتح لعبة Aviator بعد تجهيز جلسة الدخول...")
+            await page.goto(GAME_URL, wait_until="domcontentloaded", timeout=60000)
+            print(f"[GAME] loaded={safe_url(page.url)}", flush=True)
+            if page.url.startswith("chrome-error://"):
+                raise RuntimeError("Chrome لم يستطع الوصول إلى صفحة Aviator. تحقق من الاتصال أو VPN.")
+        except Exception as exc:
+            set_status("page_error", f"تعذر فتح الصفحة: {exc}")
+            try:
+                await context.close()
+            except Exception:
+                pass
+            raise
+
+        if SFS_DECODER_AVAILABLE:
+            print("[SFS] Python binary decoder: enabled", flush=True)
+        else:
+            print("[SFS] Python binary decoder: unavailable; Chrome-side SmartFox event hook remains enabled", flush=True)
+        set_status("waiting", "اترك صفحة Aviator مفتوحة. يجمع المضاعفات + بيانات العدل من HTTP/WebSocket/DOM/SmartFox events.")
+        tracker.flush_live()
+
+        probe_next = 0.0
+        fairness_probe_round = None
+        fairness_probe_next = 0.0
+        try:
+            while True:
+                if page.is_closed():
+                    raise RuntimeError("نافذة اللعبة أُغلقت.")
+
+                now = time.monotonic()
+                for pge in list(context.pages):
+                    try:
+                        frames = list(pge.frames)
+                    except Exception:
+                        continue
+
+                    for frame in frames:
+                        try:
+                            scrape = await frame.evaluate(SCRAPE_JS)
+                        except Exception:
+                            continue
+                        if isinstance(scrape, dict):
+                            if now >= probe_next:
+                                print(
+                                    f"[PAGE] title={str(scrape.get('title') or '')[:120]!r} "
+                                    f"frame={safe_url(scrape.get('href') or '')} "
+                                    f"buf={len(scrape.get('buf') or [])}",
+                                    flush=True,
+                                )
+                            tracker.ingest_dom(scrape)
+                            combined = " ".join([
+                                str(scrape.get("href") or ""),
+                                str(scrape.get("text") or ""),
+                                str(scrape.get("html") or ""),
+                            ])
+                            if re.search(r"(?i)seed|provably|fair|nonce", combined):
+                                log_diag({
+                                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "source": "dom_candidate",
+                                    "url": safe_url(scrape.get("href") or ""),
+                                    "title": scrape.get("title"),
+                                    "frames": scrape.get("frames") or [],
+                                    "labeled_count": len(scrape.get("labeled") or []),
+                                    "attributes_count": len(scrape.get("attrs") or []),
+                                    "meta_count": len(scrape.get("meta") or []),
+                                    "script_count": len(scrape.get("scripts") or []),
+                                })
+
+                # Automatically open Fairness after each completed round.
+                # This causes the game client to emit the same fairness request
+                # that normally occurs when the user opens the Fairness panel.
+                latest_round = tracker.last_round_id
+                if latest_round and latest_round != fairness_probe_round and now >= fairness_probe_next:
+                    clicked = await _trigger_fairness_ui(context, latest_round)
+                    fairness_probe_next = now + 2.0
+                    if clicked:
+                        fairness_probe_round = latest_round
+
+                if now >= probe_next:
+                    probe_next = now + 5.0
+                await asyncio.sleep(1.0)
+        finally:
+            try:
+                await context.close()
+            except Exception as exc:
+                print(f"[COLLECTOR] context close warning: {exc}", flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        set_status("stopped", "تم إيقاف الجامع.")
+    except Exception as exc:
+        set_status("error", str(exc))
+        raise
+

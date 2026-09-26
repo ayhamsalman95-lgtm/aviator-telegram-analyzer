@@ -1,0 +1,431 @@
+﻿eedresponse":
+            # In the observed Aviator stream, serverSeedSHA256 may be nested
+            # inside the decoded SFS payload. Search recursively instead of
+            # assuming it exists at the top level.
+            rid_value = self._recursive_value(
+                data, {"roundId", "round_id", "gameId", "game_id", "id"}
+            )
+            rid = str(rid_value) if rid_value not in (None, "") else None
+
+            raw_hash = self._recursive_value(
+                data,
+                {
+                    "serverSeedSHA256", "serverSeedSha256",
+                    "server_seed_sha256", "seedHash", "seed_hash"
+                },
+            )
+            seed_hash = None
+            if isinstance(raw_hash, str) and re.fullmatch(r"[0-9a-fA-F]{64}", raw_hash.strip()):
+                seed_hash = raw_hash.strip().lower()
+
+            extracted = {
+                "seed_hash": [seed_hash] if seed_hash else [],
+                "server_seed": [],
+                "client_seeds": [],
+                "combined_hash": [],
+                "nonce": [],
+            }
+
+            raw_server = self._recursive_value(data, {"serverSeed", "server_seed"})
+            if isinstance(raw_server, str) and raw_server.strip():
+                extracted["server_seed"] = [raw_server.strip()]
+
+            raw_client = self._recursive_value(data, {"clientSeed", "client_seed"})
+            if isinstance(raw_client, str) and raw_client.strip():
+                extracted["client_seeds"] = [raw_client.strip()]
+
+            raw_nonce = self._recursive_value(
+                data, {"nonce", "serverSeedNonce", "server_seed_nonce"}
+            )
+            if raw_nonce not in (None, ""):
+                extracted["nonce"] = [raw_nonce]
+
+            meaningful = any(extracted.values())
+            if meaningful:
+                target_rid = rid or self.last_round_id
+                print(
+                    f"[SFS] FAIRNESS serverSeedResponse hash={'yes' if seed_hash else 'no'} "
+                    f"server_seed={'yes' if extracted['server_seed'] else 'no'} round_id={target_rid or '-'}",
+                    flush=True,
+                )
+                self.apply_seeds(
+                    extracted,
+                    "sfs:serverSeedResponse",
+                    url,
+                    target_round_id=target_rid,
+                )
+            else:
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "sfs_fairness_response_empty",
+                    "url": safe_url(url),
+                    "command": event_type,
+                    "keys": sorted(str(k) for k in d.keys()),
+                })
+            return
+
+        # V8: roundChartInfo is the authoritative completed-round message for
+        # the Spribe Aviator stream observed here: it carries maxMultiplier
+        # together with roundId. Do NOT use cashout/bet multipliers.
+        if normalized_et in ROUND_RESULT_COMMANDS:
+            chart = data if isinstance(data, dict) else {}
+            rid = None
+            for key in ("roundId", "round_id"):
+                if chart.get(key) not in (None, ""):
+                    rid = str(chart.get(key))
+                    break
+            value = None
+            for key in ("maxMultiplier", "max_multiplier"):
+                if key in chart:
+                    value = as_float(chart.get(key))
+                    if value is not None:
+                        break
+
+            if rid is None or value is None:
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "sfs_round_result_invalid",
+                    "url": safe_url(url),
+                    "command": event_type,
+                    "round_id": rid,
+                    "max_multiplier": chart.get("maxMultiplier") if isinstance(chart, dict) else None,
+                    "keys": sorted(str(k) for k in chart.keys()) if isinstance(chart, dict) else [],
+                })
+                return
+
+            # One completed record per round. A repeated SmartFox delivery of
+            # the same roundChartInfo must not create duplicate Telegram alerts.
+            if rid == self.last_round_id or (rid, round(value, 6)) in self.seen_crashes:
+                return
+            self.seen_crashes.add((rid, round(value, 6)))
+
+            print(f"[SFS] ROUND_RESULT round_id={rid} maxMultiplier={value:.2f}x", flush=True)
+            self.finish_round(rid, value, chart, url, source="sfs:roundChartInfo")
+            return
+
+        # Never interpret player cashout/bet/online-player messages as a round
+        # result. Those messages legitimately contain monetary/cashout
+        # multipliers and were the source of the repeated false OnCrash values.
+        if normalized_et in NON_CRASH_COMMANDS:
+            return
+
+        # Preserve seed/fairness evidence from decoded SFS data.
+        try:
+            extracted = extract_seed_fields(data, short_ok=True)
+            self.apply_seeds(extracted, f"sfs-event:{event_type}", url)
+        except Exception:
+            pass
+
+        # changeState announces the next round id before the chart result for
+        # the previous round arrives. Keep the id for live diagnostics, but do
+        # not save a result from state changes themselves.
+        if normalized_et == "changestate" and isinstance(data, dict):
+            rid = None
+            for key in ("roundId", "round_id"):
+                if data.get(key) not in (None, ""):
+                    rid = str(data.get(key))
+                    break
+            if rid:
+                self.current["id"] = rid
+                state_id = data.get("newStateId")
+                self.current["phase"] = {1: "betting", 2: "flying", 3: "crashed"}.get(state_id, "waiting")
+                self.flush_live(force_predict=state_id == 1)
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "sfs_change_state",
+                    "url": safe_url(url),
+                    "round_id": rid,
+                    "new_state_id": state_id,
+                })
+
+        raw_lower = json.dumps(data, ensure_ascii=False, default=str).lower()
+
+        # Only accept an SFS packet as a crash/result event when:
+        #   1) its command clearly indicates round end/crash/result, OR
+        #   2) it contains a strong crash-specific field.
+        command_is_crash = any(h in normalized_et for h in CRASH_COMMAND_HINTS)
+        has_strong_key = any(k.lower() in raw_lower for k in STRONG_MULTIPLIER_KEYS)
+
+        if not command_is_crash and not has_strong_key:
+            # Keep diagnostics for likely state/history packets, but never save
+            # them as a round result.
+            if normalized_et in {"changestate", "roundchartinfo", "onstage", "onstart"}:
+                log_network({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": "sfs_candidate_no_crash",
+                    "url": safe_url(url),
+                    "command": event_type,
+                    "data_keys": (
+                        sorted(str(k) for k in data.keys())
+                        if isinstance(data, dict) else []
+                    ),
+                })
+            return
+
+        value, rid = _event_multiplier_and_id(
+            data,
+            allow_generic=command_is_crash,
+        )
+        if value is None:
+            log_network({
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "kind": "sfs_candidate_no_multiplier",
+                "url": safe_url(url),
+                "command": event_type,
+                "data_keys": (
+                    sorted(str(k) for k in data.keys())
+                    if isinstance(data, dict) else []
+                ),
+            })
+            return
+
+        rid = rid or event_id_for(
+            data if isinstance(data, dict) else {},
+            value,
+            json.dumps(data, ensure_ascii=False, default=str),
+        )
+        key = (rid, round(value, 6))
+        if key in self.seen_crashes:
+            return
+
+        # Additional guard: state/history packets containing a generic
+        # "multiplier" are not enough by themselves.
+        if not command_is_crash and not any(
+            isinstance(obj, dict) and any(k in obj for k in STRONG_MULTIPLIER_KEYS)
+            for obj in _walk_dicts(data)
+        ):
+            return
+
+        self.seen_crashes.add(key)
+        self.finish_round(rid, value, data if isinstance(data, dict) else {}, url)
+
+    def ingest_dom(self, scrape: dict) -> None:
+        url = scrape.get("href") or ""
+        html = scrape.get("html") or ""
+        self.apply_seeds(parse_labeled_text(scrape.get("text") or ""), "dom-text", url)
+        self.apply_seeds(parse_labeled_text(html), "dom-html", url)
+        self.apply_seeds(parse_html_attributes(html), "dom-html-attributes", url)
+        for item in scrape.get("labeled") or []:
+            self.apply_seeds(parse_labeled_text(item.get("text") or ""), "dom-node", url)
+        for item in scrape.get("attrs") or []:
+            self.apply_seeds(parse_labeled_text(f"{item.get('name')}: {item.get('value')}"), "dom-attribute", url)
+        for item in scrape.get("meta") or []:
+            self.apply_seeds(parse_labeled_text(f"{item.get('name')}: {item.get('value')}"), "dom-meta", url)
+        for script in scrape.get("scripts") or []:
+            self.apply_seeds(parse_labeled_text(script), "dom-script", url)
+            self.ingest_generic("dom-script", url, script, process_hex=True)
+        storage = scrape.get("storage") or {}
+        if storage:
+            self.apply_seeds(extract_seed_fields(storage, short_ok=True), "dom-storage", url)
+            self.ingest_generic("dom-storage", url, json.dumps(storage, ensure_ascii=False))
+        for frame in scrape.get("buf") or []:
+            if not isinstance(frame, dict):
+                continue
+            direction = str(frame.get("dir") or "")
+            if direction == "sfs-event":
+                self.ingest_sfs_event(frame, frame.get("url") or url)
+                continue
+            self.ingest_generic(
+                "injected-ws-" + direction,
+                frame.get("url") or url,
+                frame.get("data"),
+            )
+
+    def _maybe_generic_crash(self, obj: Any, raw: str, url: str) -> None:
+        if not isinstance(obj, dict):
+            return
+        kind = str(obj.get("type") or obj.get("event") or obj.get("code") or "").lower()
+        if not any(word in kind for word in ("crash", "flew", "round_end", "roundend", "game_crash")):
+            return
+        value = None
+        for key in ("f", "multiplier", "coefficient", "crashPoint", "crash", "result"):
+            value = as_float(obj.get(key))
+            if value is not None:
+                break
+        inner = obj.get("crash") or obj.get("data") or obj.get("payload")
+        if value is None and isinstance(inner, dict):
+            for key in ("f", "multiplier", "coefficient", "crashPoint"):
+                value = as_float(inner.get(key))
+                if value is not None:
+                    obj = inner
+                    break
+        if value is None:
+            return
+        rid = event_id_for(obj, value, raw)
+        key = (rid, round(value, 6))
+        if key in self.seen_crashes:
+            return
+        self.seen_crashes.add(key)
+        self.finish_round(rid, value, obj, url)
+
+    def flush_live(self, force_predict: bool = False) -> None:
+        state = {
+            "phase": self.current.get("phase") or "waiting",
+            "round_id": self.current.get("id"),
+            "seed_hash": self.current.get("seed_hash"),
+            "server_seed": self.current.get("server_seed"),
+            "client_seeds": list(self.current.get("client_seeds") or []),
+            "combined_hash": self.current.get("combined_hash"),
+            "nonce": self.current.get("nonce"),
+            "multiplier": self.current.get("multiplier"),
+            "seed_hits": self.seed_hits,
+            "seed_sources": self.current.get("seed_sources") or {},
+        }
+        if force_predict:
+            state["predict_token"] = f"{state.get('round_id')}-{int(time.time())}"
+        save_live(state)
+
+
+def _short(value: Any, n: int = 10) -> str:
+    if not value:
+        return "-"
+    s = str(value)
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _seed_summary(record: dict) -> str:
+    return f"hash={_short(record.get('seed_hash'))} server={_short(record.get('server_seed'))} c={len(record.get('client_seeds') or [])}"
+
+
+def _is_game_host(host: str) -> bool:
+    h = (host or "").lower().split(":", 1)[0]
+    for hint in GAME_HOST_HINTS:
+        if h == hint or h.endswith("." + hint):
+            return True
+    return False
+
+
+def _candidate_response(response: Response) -> bool:
+    try:
+        u = urlsplit(response.url)
+        host = u.netloc.lower()
+        path = u.path.lower()
+    except Exception:
+        return False
+
+    if _is_game_host(host):
+        return True
+
+    # Support common game iframe / websocket helper endpoints without opening
+    # every unrelated response on the page.
+    return any(marker in path for marker in (
+        "/games-frame/",
+        "/game-crash",
+        "/game/",
+        "/signalr",
+        "/hub",
+    ))
+
+
+# AVIATOR_V11_AUTO_FAIRNESS
+FAIRNESS_UI_RE = re.compile(
+    r"(?i)(provably\s*fair|fairness|game\s*fairness|العدل|نزاهة|التحقق)"
+)
+
+
+async def _trigger_fairness_ui(context, round_id: str) -> bool:
+    """Open Aviator Provably Fair Settings only."""
+
+    settings_re = re.compile(
+        r"(?i)provably\s*fair\s*(settings|configuration)"
+    )
+
+    seed_re = re.compile(
+        r"(?i)(server\s*seed|client\s*seed|seed\s*hash|nonce|"
+        r"بذرة\s*الخادم|بذرة\s*العميل)"
+    )
+
+    # Never click the general "Provably Fair Game" link.
+    for pge in list(context.pages):
+        for frame in list(pge.frames):
+
+            # Only inspect the Aviator game frame.
+            try:
+                url = frame.url or ""
+            except Exception:
+                continue
+
+            if "aviator-next.spribegaming.com" not in url:
+                continue
+
+            print(
+                f"[FAIRNESS] inspecting Aviator controls round={round_id}",
+                flush=True
+            )
+
+            try:
+                loc = frame.locator(
+                    "button, a, [role='button'], "
+                    "[aria-label], [title]"
+                )
+                count = min(await loc.count(), 200)
+            except Exception:
+                continue
+
+            # Print useful controls so we can identify the real Aviator menu.
+            for i in range(count):
+                try:
+                    el = loc.nth(i)
+
+                    if not await el.is_visible():
+                        continue
+
+                    aria = str(
+                        await el.get_attribute("aria-label") or ""
+                    )
+                    title = str(
+                        await el.get_attribute("title") or ""
+                    )
+                    text_value = str(
+                        await el.inner_text(timeout=300) or ""
+                    )
+
+                    label = " ".join(
+                        x for x in [aria, title, text_value] if x
+                    ).strip()
+
+                    if label:
+                        print(
+                            f"[FAIRNESS] AVIATOR CONTROL: "
+                            f"{label[:250]}",
+                            flush=True
+                        )
+
+                except Exception:
+                    continue
+
+            # Search only for actual Settings.
+            try:
+                loc = frame.locator(
+                    "button, a, [role='button'], "
+                    "[aria-label], [title]"
+                )
+                count = min(await loc.count(), 200)
+            except Exception:
+                continue
+
+            for i in range(count):
+                try:
+                    el = loc.nth(i)
+
+                    if not await el.is_visible():
+                        continue
+
+                    label = " ".join([
+                        str(await el.get_attribute("aria-label") or ""),
+                        str(await el.get_attribute("title") or ""),
+                        str(await el.inner_text(timeout=300) or "")
+                    ]).strip()
+
+                    # IMPORTANT:
+                    # "Provably Fair Game" is deliberately rejected.
+                    if not settings_re.search(label):
+                        continue
+
+                    print(
+                        f"[FAIRNESS] SETTINGS candidate round={round_id}: "
+                        f"{label[:200]}",
+                        flush=True
+                    )
+
+  

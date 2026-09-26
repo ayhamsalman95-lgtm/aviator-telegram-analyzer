@@ -1,0 +1,498 @@
+﻿"""Chrome collector V10 for real Aviator rounds and Provably-Fair evidence.
+
+V8 uses Aviator roundChartInfo.maxMultiplier + roundId as the authoritative completed-round result. Cashout/bet payloads are never treated as round results.\n\nThe collector does two separate jobs:
+1) read the real round/multiplier stream from Chrome;
+2) capture and associate seed/hash evidence without fabricating values.
+
+Important: a server-seed reveal can arrive after OnCrash, so seed enrichment is
+applied back to the already-saved round instead of being discarded.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import time
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from playwright.async_api import Response
+from playwright.async_api import async_playwright
+
+try:
+    from sfs2x import decode_s2c_packet, parse_s2c_command
+    SFS_DECODER_AVAILABLE = True
+except Exception:
+    decode_s2c_packet = None
+    parse_s2c_command = None
+    SFS_DECODER_AVAILABLE = False
+
+from fairness import verify_round
+from seeds import (
+    extract_hex_from_text,
+    extract_seed_fields,
+    merge_seed_state,
+    noisy_url,
+    parse_html_attributes,
+    parse_labeled_text,
+)
+from store import (
+    BASE,
+    CONFIG,
+    append_diagnostic,
+    append_seed_log,
+    last_round,
+    load_rounds,
+    save_live,
+    set_status,
+    upsert_round,
+)
+
+# The project is an Aviator collector.  The previous fallback pointed to a
+# generic Crash page, which could make the collector monitor the wrong game.
+DEFAULT_AVIATOR_URL = "https://1xlite-130003.top/ar/casino-search?game=52358"
+SITE_HOME_URL = "https://1xlite-130003.top/ar/"
+LOGIN_WAIT_SECONDS = 180
+
+
+def normalize_game_url(raw_url: Any) -> str:
+    """Return a usable Aviator URL and prevent the old Crash fallback."""
+    value = str(raw_url or "").strip()
+    if not value:
+        return DEFAULT_AVIATOR_URL
+
+    try:
+        p = urlsplit(value)
+        path = (p.path or "").lower().rstrip("/")
+        # Explicitly replace the old generic Crash fallback.
+        if path.endswith("/games/crash"):
+            return DEFAULT_AVIATOR_URL
+    except Exception:
+        return DEFAULT_AVIATOR_URL
+
+    return value
+
+
+GAME_URL = normalize_game_url(CONFIG.get("game_url"))
+PROFILE = BASE / "chrome_profile"
+NETWORK_LOG = BASE / "game_network.jsonl"
+DIAGNOSTICS_LOG = BASE / "diagnostics.jsonl"
+MAX_LOG_PAYLOAD = 400_000
+MAX_HTML = 120_000
+NUM_RE = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*x?\s*$", re.I)
+
+GAME_HOST_HINTS = {
+    "1xlite-130003.top",
+    "1xbet.com",
+}
+
+SIGNALR_TARGETS = {
+    "OnCrash", "OnStart", "OnStage", "OnBetting", "OnRegistration",
+    "OnCashouts", "OnBets", "OnProfits", "OnUpdate", "OnTops",
+}
+
+SECRET_QUERY_KEYS = re.compile(
+    r"(?i)^(token|access_token|refresh_token|authorization|auth|password|pass|secret|signature|sig|cookie|session|sid)$"
+)
+SECRET_JSON_KEYS = re.compile(
+    r"(?i)(password|passwd|token|access_token|refresh_token|authorization|cookie|set-cookie|secret)"
+)
+
+INJECT_JS = r"""
+(() => {
+  if (window.__aviatorHooked) return;
+  window.__aviatorHooked = true;
+  window.__aviatorBuf = [];
+  const push = (item) => {
+    try {
+      window.__aviatorBuf.push(item);
+      if (window.__aviatorBuf.length > 1200) window.__aviatorBuf.splice(0, 600);
+    } catch (e) {}
+  };
+
+  const wrap = (Orig) => {
+    if (!Orig) return Orig;
+    const WS = function(url, protocols) {
+      const ws = protocols !== undefined ? new Orig(url, protocols) : new Orig(url);
+      ws.addEventListener("message", (ev) => {
+        let data;
+        try {
+          data = typeof ev.data === "string" ? ev.data
+            : (ev.data && ev.data.byteLength ? `[binary:${ev.data.byteLength}]` : String(ev.data));
+        } catch (e) { data = String(ev.data); }
+        push({ t: Date.now(), dir: "in", url: String(url), data: data.slice(0, 500000) });
+      });
+      const origSend = ws.send.bind(ws);
+      ws.send = function(data) {
+        let text;
+        try {
+          text = typeof data === "string" ? data
+            : (data && data.byteLength ? `[binary:${data.byteLength}]` : String(data));
+        } catch (e) { text = String(data); }
+        push({ t: Date.now(), dir: "out", url: String(url), data: text.slice(0, 300000) });
+        return origSend(data);
+      };
+      return ws;
+    };
+    try { WS.prototype = Orig.prototype; } catch (e) {}
+    try {
+      WS.CONNECTING = Orig.CONNECTING; WS.OPEN = Orig.OPEN;
+      WS.CLOSING = Orig.CLOSING; WS.CLOSED = Orig.CLOSED;
+    } catch (e) {}
+    return WS;
+  };
+  try { window.WebSocket = wrap(window.WebSocket); } catch (e) {}
+
+  // Capture fetch/XHR text that Playwright may not classify as a normal response
+  // body (for example a blob/json endpoint used only inside an iframe).
+  try {
+    const origFetch = window.fetch;
+    window.fetch = async function(...args) {
+      const response = await origFetch.apply(this, args);
+      try {
+        const clone = response.clone();
+        const text = await clone.text();
+        push({ t: Date.now(), dir: "fetch-response", url: String(response.url || (args[0] && args[0].url) || args[0] || ""), status: response.status, data: text.slice(0, 400000) });
+      } catch (e) {}
+      return response;
+    };
+  } catch (e) {}
+
+  try {
+    const XHR = XMLHttpRequest.prototype;
+    const open = XHR.open;
+    const send = XHR.send;
+    XHR.open = function(method, url, ...rest) {
+      this.__aviatorMethod = method;
+      this.__aviatorUrl = String(url);
+      return open.call(this, method, url, ...rest);
+    };
+    XHR.send = function(body) {
+      try {
+        this.addEventListener("load", () => {
+          let text = "";
+          try { text = String(this.responseText || ""); } catch (e) {}
+          push({ t: Date.now(), dir: "xhr-response", method: this.__aviatorMethod, url: this.__aviatorUrl, status: this.status, data: text.slice(0, 400000) });
+        });
+      } catch (e) {}
+      return send.call(this, body);
+    };
+  } catch (e) {}
+
+  // SmartFoxServer HTML5 clients decode the wire protocol inside the page
+  // and then dispatch high-level events. Hook dispatchEvent as well, so the
+  // collector can observe those already-decoded events instead of depending
+  // only on raw websocket JSON.
+  try {
+    const seen = new WeakSet();
+    const snapshot = (value, depth = 0) => {
+      if (depth > 5) return "<depth>";
+      if (value === null || value === undefined) return value;
+      const typ = typeof value;
+      if (typ === "string" || typ === "number" || typ === "boolean") return value;
+      if (typ === "bigint") return String(value);
+      if (typ === "function") return "<function>";
+      if (typ !== "object") return String(value);
+      if (value instanceof Uint8Array) {
+        return { _binary: true, length: value.byteLength, hex: Array.from(value.slice(0, 256)).map(x => x.toString(16).padStart(2, "0")).join("") };
+      }
+      if (seen.has(value)) return "<cycle>";
+      seen.add(value);
+      if (Array.isArray(value)) return value.slice(0, 120).map(v => snapshot(v, depth + 1));
+
+      // SFSObject/SFSArray expose key accessors in the JavaScript API.
+      try {
+        if (typeof value.getKeysArray === "function") {
+          const out = {};
+          const keys = value.getKeysArray() || [];
+          for (const k of keys.slice(0, 120)) {
+            try { out[String(k)] = snapshot(value.get(k), depth + 1); } catch (e) {}
+          }
+          return out;
+        }
+      } catch (e) {}
+
+      const out = {};
+      let count = 0;
+      for (const k of Object.keys(value)) {
+        if (count++ >= 120) break;
+        if (/^(password|passwd|token|access_token|refresh_token|authorization|cookie|secret|signature|sig)$/i.test(k)) {
+          out[k] = "<redacted>";
+          continue;
+        }
+        try { out[k] = snapshot(value[k], depth + 1); } catch (e) {}
+      }
+      return out;
+    };
+
+    let lastState = false;
+    const tryHookSFS = () => {
+      try {
+        const ns = window.SFS2X;
+        const C = ns && ns.SmartFox;
+        if (!C || !C.prototype || typeof C.prototype.dispatchEvent !== "function") return false;
+        if (C.prototype.__aviatorDispatchHooked) return true;
+        const origDispatch = C.prototype.dispatchEvent;
+        C.prototype.dispatchEvent = function(evt) {
+          try {
+            push({
+              t: Date.now(),
+              dir: "sfs-event",
+              event_type: String(evt && evt.type || ""),
+              data: snapshot(evt),
+            });
+          } catch (e) {}
+          return origDispatch.apply(this, arguments);
+        };
+        C.prototype.__aviatorDispatchHooked = true;
+        if (!lastState) {
+          push({ t: Date.now(), dir: "sfs-hook", status: "hooked" });
+          lastState = true;
+        }
+        return true;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    tryHookSFS();
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries += 1;
+      if (tryHookSFS() || tries > 240) clearInterval(timer);
+    }, 500);
+  } catch (e) {}
+})();
+"""
+
+SCRAPE_JS = r"""
+() => {
+  const text = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 30000) : "";
+  const html = (document.documentElement && document.documentElement.innerHTML) ? document.documentElement.innerHTML.slice(0, 120000) : "";
+  const labeled = [];
+  const attrs = [];
+  const meta = [];
+  const scripts = [];
+  const frames = [];
+
+  const nodes = document.querySelectorAll("[class*='seed' i], [class*='hash' i], [class*='fair' i], [class*='nonce' i], [class*='provably' i], [id*='seed' i], [id*='hash' i], [id*='fair' i], [id*='nonce' i], [data-seed], [data-seed-hash], [data-server-seed], [data-client-seed]");
+  nodes.forEach((el) => {
+    const t = (el.innerText || el.textContent || "").trim();
+    if (t && t.length < 1000) labeled.push({ cls: String(el.className || ""), id: String(el.id || ""), text: t });
+    try {
+      for (const a of Array.from(el.attributes || [])) {
+        const name = String(a.name || "");
+        const val = String(a.value || "");
+        if (/seed|hash|nonce|fair|provably/i.test(name)) attrs.push({ name, value: val.slice(0, 1000) });
+      }
+    } catch (e) {}
+  });
+
+  document.querySelectorAll("meta[name], meta[property], input[name], input[id], [data-seed], [data-seed-hash], [data-server-seed], [data-client-seed], [data-nonce]").forEach((el) => {
+    try {
+      const name = el.getAttribute("name") || el.getAttribute("property") || el.getAttribute("id") || el.getAttribute("data-seed") || "";
+      const value = el.getAttribute("content") || el.getAttribute("value") || el.getAttribute("data-value") || el.getAttribute("data-seed") || el.textContent || "";
+      if (/seed|hash|nonce|fair|provably/i.test(String(name))) meta.push({ name: String(name), value: String(value).slice(0, 1000) });
+    } catch (e) {}
+  });
+
+  document.querySelectorAll("script").forEach((el) => {
+    try {
+      const t = String(el.textContent || "");
+      if (/seed|serverseed|clientseed|provably|fair|nonce/i.test(t)) scripts.push(t.slice(0, 20000));
+    } catch (e) {}
+  });
+
+  document.querySelectorAll("iframe").forEach((el) => {
+    try { frames.push(String(el.src || "")); } catch (e) {}
+  });
+
+  const storage = {};
+  try {
+    for (const storeName of ["localStorage", "sessionStorage"]) {
+      const store = window[storeName];
+      if (!store) continue;
+      for (let i = 0; i < store.length; i++) {
+        const k = store.key(i);
+        if (k && /seed|hash|nonce|fair|crash|aviator|provably/i.test(k)) {
+          storage[storeName + ":" + k] = String(store.getItem(k) || "").slice(0, 1000);
+        }
+      }
+    }
+  } catch (e) {}
+
+  const buf = window.__aviatorBuf ? window.__aviatorBuf.splice(0, window.__aviatorBuf.length) : [];
+  return { href: location.href, title: document.title, text, html, labeled, attrs, meta, scripts, frames, storage, buf };
+}
+"""
+
+
+def as_float(v: Any):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        x = float(v)
+        return x if x >= 1.0 else None
+    if isinstance(v, str):
+        m = NUM_RE.match(v.replace(",", "."))
+        if m:
+            x = float(m.group(1))
+            return x if x >= 1.0 else None
+    return None
+
+
+def safe_url(raw_url: str) -> str:
+    """Remove credentials and sensitive query values while retaining endpoint shape."""
+    try:
+        p = urlsplit(str(raw_url))
+        clean_q = []
+        for k, v in parse_qsl(p.query, keep_blank_values=True):
+            clean_q.append((k, "<redacted>" if SECRET_QUERY_KEYS.match(k) else v))
+        return urlunsplit((p.scheme, p.netloc, p.path, urlencode(clean_q), ""))
+    except Exception:
+        return str(raw_url).split("#", 1)[0]
+
+
+def payload_bytes(payload: Any) -> bytes | None:
+    if isinstance(payload, bytes):
+        return payload
+    if isinstance(payload, bytearray):
+        return bytes(payload)
+    if isinstance(payload, memoryview):
+        return payload.tobytes()
+    return None
+
+
+def payload_text(payload: Any) -> str:
+    b = payload_bytes(payload)
+    if b is not None:
+        return b.decode("utf-8", errors="replace")
+    return str(payload)
+
+
+def binary_preview(payload: Any, limit: int = 96) -> str:
+    b = payload_bytes(payload)
+    if b is None:
+        return ""
+    return b[:limit].hex()
+
+
+def redact_obj(value: Any) -> Any:
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if SECRET_JSON_KEYS.search(str(k)):
+                out[k] = "<redacted>"
+            else:
+                out[k] = redact_obj(v)
+        return out
+    if isinstance(value, list):
+        return [redact_obj(x) for x in value]
+    return value
+
+
+def safe_request_body(request) -> Any:
+    try:
+        body = request.post_data
+    except Exception:
+        body = None
+    if not body:
+        return None
+    body = str(body)
+    if len(body) > 10000:
+        return {
+            "truncated": True,
+            "length": len(body),
+            "sha1": hashlib.sha1(body.encode("utf-8", "ignore")).hexdigest(),
+        }
+    try:
+        return redact_obj(json.loads(body))
+    except Exception:
+        return body[:10000] if not SECRET_JSON_KEYS.search(body) else "<redacted-text>"
+
+
+def log_network(record: dict) -> None:
+    try:
+        with NETWORK_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(redact_obj(record), ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def log_diag(record: dict) -> None:
+    try:
+        append_diagnostic(redact_obj(record))
+    except Exception:
+        pass
+
+
+def json_candidates(raw: str) -> list[Any]:
+    text = (raw or "").strip()
+    if not text or text.startswith("[binary:"):
+        return []
+    chunks = [x.strip() for x in re.split(r"[\x1e\u001e\n\r]+", text) if x.strip()] or [text]
+    out: list[Any] = []
+    seen = set()
+    for chunk in chunks:
+        if chunk in seen:
+            continue
+        seen.add(chunk)
+        try:
+            out.append(json.loads(chunk))
+            continue
+        except Exception:
+            pass
+        for pos in [m.start() for m in re.finditer(r"[\{\[]", chunk)][:20]:
+            try:
+                out.append(json.loads(chunk[pos:]))
+            except Exception:
+                continue
+    return out
+
+
+def event_id_for(obj: dict, multiplier: float | None, raw: str) -> str:
+    for key in ("l", "id", "roundId", "round_id", "gameId", "ts"):
+        if obj.get(key) not in (None, ""):
+            return str(obj.get(key))
+    basis = raw[:800] if raw else json.dumps(obj, ensure_ascii=False)[:800]
+    return hashlib.sha1(basis.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def verification_record(record: dict) -> dict:
+    verify = verify_round(
+        record.get("multiplier"),
+        server_seed=record.get("server_seed") or "",
+        client_seeds=record.get("client_seeds") or [],
+        seed_hash=record.get("seed_hash") or "",
+        nonce=record.get("nonce"),
+    )
+    return {
+        "verified": verify.ok,
+        "verify_scheme": verify.scheme,
+        "verify_detail": verify.detail,
+        "verified_multiplier": verify.expected_multiplier,
+        "hash_match": verify.hash_match,
+        "verify_tried": verify.tried,
+        "verification_updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _walk_dicts(value: Any, max_nodes: int = 500):
+    stack = [value]
+    seen = set()
+    count = 0
+    while stack and count < max_nodes:
+        cur = stack.pop()
+        count += 1
+        if isinstance(cur, dict):
+            ident = id(cur)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            yield cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur[:120])
+
+
+STRONG_MULTIPLIER_KEYS = {
+

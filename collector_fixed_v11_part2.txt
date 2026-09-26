@@ -1,0 +1,408 @@
+﻿    "crashPoint", "crash_point", "finalMultiplier", "final_multiplier",
+    "crashMultiplier", "crash_multiplier", "crashedAt", "crashed_at",
+    "gameMultiplier", "game_multiplier", "endMultiplier", "end_multiplier",
+}
+CRASH_COMMAND_HINTS = {
+    "crash", "roundend", "round_end", "roundresult", "round_result",
+    "gameresult", "game_result", "gamecrash", "game_crash",
+    "roundcrashed", "round_crashed",
+}
+NON_CRASH_COMMANDS = {
+    "updatecurrentcashouts", "currentbetsinfo", "updatecurrentbets",
+    "onlineplayers", "x", "init", "ping_response", "pingresponse",
+    "updatecurrentcashout",
+}
+
+ROUND_RESULT_COMMANDS = {
+    "roundchartinfo",
+}
+
+
+
+def _event_multiplier_and_id(value: Any, *, allow_generic: bool = False):
+    """Extract only strong, crash-specific multiplier fields.
+
+    Generic fields such as result/factor/coef are intentionally excluded because
+    Aviator player-cashout/bet payloads can contain those values and they are not
+    the round crash point.
+    """
+    id_keys = ("roundId", "round_id", "gameId", "game_id", "id", "l")
+    best_value = None
+    best_id = None
+    for obj in _walk_dicts(value):
+        for key in id_keys:
+            if obj.get(key) not in (None, ""):
+                best_id = str(obj.get(key))
+                break
+        for key in STRONG_MULTIPLIER_KEYS:
+            if key in obj:
+                v = as_float(obj.get(key))
+                if v is not None:
+                    best_value = v
+                    break
+        if best_value is None and allow_generic:
+            for key in ("multiplier", "coefficient", "multiplierValue"):
+                if key in obj:
+                    v = as_float(obj.get(key))
+                    if v is not None:
+                        best_value = v
+                        break
+        if best_value is not None:
+            break
+    return best_value, best_id
+
+
+class RoundTracker:
+    def __init__(self):
+        previous = last_round() or {}
+        self.current: dict = {
+            "id": None,
+            "phase": "waiting",
+            "seed_hash": None,
+            "server_seed": None,
+            "client_seeds": [],
+            "combined_hash": None,
+            "nonce": None,
+            "multiplier": None,
+        }
+        self.pending_commitment: dict = {}
+        self.last_round_id = str(previous.get("id")) if previous.get("id") not in (None, "") else None
+        self.seen_crashes: set[tuple] = set()
+        self.seed_hits = 0
+        self.last_seed_fingerprint = None
+
+    def _field_count(self, state: dict) -> int:
+        return sum(1 for k in ("seed_hash", "server_seed", "combined_hash", "nonce") if state.get(k)) + len(state.get("client_seeds") or [])
+
+    def _merge_sources(self, state: dict, extracted: dict, source: str) -> dict:
+        sources = dict(state.get("seed_sources") or {})
+        for key in ("seed_hash", "server_seed", "combined_hash", "nonce"):
+            vals = extracted.get(key) or []
+            if vals:
+                sources[key] = {"source": source, "value": vals[0]}
+        clients = extracted.get("client_seeds") or []
+        if clients:
+            sources["client_seeds"] = {"source": source, "count": len(clients)}
+        state["seed_sources"] = sources
+        return state
+
+    def _apply_to_saved_round(self, round_id: str, extracted: dict, source: str, url: str) -> bool:
+        rid = str(round_id)
+        rounds = load_rounds()
+        existing = next((dict(r) for r in rounds if str(r.get("id")) == rid), None)
+        if existing is None:
+            return False
+        before = json.dumps(existing, sort_keys=True, default=str)
+        merged = merge_seed_state(existing, extracted)
+        merged = self._merge_sources(merged, extracted, source)
+        if merged.get("id") is None:
+            merged["id"] = rid
+        merged.update(verification_record(merged))
+        after = json.dumps(merged, sort_keys=True, default=str)
+        if before == after:
+            return False
+        upsert_round(merged)
+        append_seed_log({
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source,
+            "url": safe_url(url),
+            "round_id": rid,
+            "mode": "late_enrichment",
+            "extracted": extracted,
+            "state": {
+                "seed_hash": merged.get("seed_hash"),
+                "server_seed": merged.get("server_seed"),
+                "client_seeds": merged.get("client_seeds"),
+                "nonce": merged.get("nonce"),
+                "combined_hash": merged.get("combined_hash"),
+            },
+        })
+        return True
+
+    def apply_seeds(self, extracted: dict, source: str, url: str = "", target_round_id: str | None = None) -> None:
+        if not extracted:
+            return
+        meaningful = any(extracted.get(k) for k in ("seed_hash", "server_seed", "client_seeds", "combined_hash", "nonce"))
+        if not meaningful:
+            return
+
+        rid = str(target_round_id) if target_round_id not in (None, "") else None
+        has_server = bool(extracted.get("server_seed"))
+
+        # Explicit round id is authoritative. Never attach evidence for one
+        # round to a different active round.
+        if rid is not None:
+            if self.current.get("id") == rid:
+                target_state = self.current
+                before = json.dumps(target_state, sort_keys=True, default=str)
+                self.current = merge_seed_state(target_state, extracted)
+                self.current = self._merge_sources(self.current, extracted, source)
+                after = json.dumps(self.current, sort_keys=True, default=str)
+                if before != after:
+                    self.seed_hits += 1
+                    append_seed_log({
+                        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "source": source,
+                        "url": safe_url(url),
+                        "round_id": rid,
+                        "mode": "active-explicit",
+                        "extracted": extracted,
+                    })
+                    self.flush_live()
+                return
+
+            if self._apply_to_saved_round(rid, extracted, source, url):
+                self.seed_hits += 1
+                return
+
+            # The round has an explicit id but is not saved yet. Keep it
+            # isolated until OnBetting/OnStart creates the matching state.
+            pending = merge_seed_state({}, extracted)
+            pending = self._merge_sources(pending, extracted, source)
+            pending["round_id"] = rid
+            pending["explicit_round_id"] = True
+            self.pending_commitment = pending
+            self.seed_hits += 1
+            return
+
+        # Server-seed reveals without an explicit round id are normally for the
+        # round that just crashed. Bind them to the last completed round.
+        if rid is None and self.last_round_id:
+            if self._apply_to_saved_round(self.last_round_id, extracted, source, url):
+                self.seed_hits += 1
+                return
+
+        if self.current.get("id") is None:
+            pending = merge_seed_state(self.pending_commitment, extracted)
+            pending = self._merge_sources(pending, extracted, source)
+            self.pending_commitment = pending
+            self.seed_hits += 1
+            return
+
+        before = json.dumps(self.current, sort_keys=True, default=str)
+        self.current = merge_seed_state(self.current, extracted)
+        self.current = self._merge_sources(self.current, extracted, source)
+        after = json.dumps(self.current, sort_keys=True, default=str)
+        if before != after:
+            self.seed_hits += 1
+            append_seed_log({
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "source": source,
+                "url": safe_url(url),
+                "round_id": self.current.get("id"),
+                "mode": "active",
+                "extracted": extracted,
+            })
+            self.flush_live()
+
+    def on_signalr(self, obj: dict, raw: str, url: str) -> None:
+        target = obj.get("target")
+        args = obj.get("arguments") or []
+        payload = args[0] if args and isinstance(args[0], dict) else {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        rid = None
+        for key in ("l", "id", "roundId", "round_id", "gameId"):
+            if payload.get(key) not in (None, ""):
+                rid = str(payload.get(key))
+                break
+
+        # Establish the round state before attaching seed evidence to explicit
+        # OnBetting/OnStage/OnStart events. This prevents a new round's
+        # commitment from being attached to the previous round.
+        if target in ("OnStage", "OnBetting") and rid:
+            self._begin_round(rid, target)
+        elif target == "OnStart" and rid:
+            if self.current.get("id") != rid:
+                self._begin_round(rid, "waiting")
+            else:
+                self.current["phase"] = "flying"
+                self.flush_live()
+
+        if target != "OnCrash":
+            extracted = extract_seed_fields(obj, short_ok=target in SIGNALR_TARGETS)
+            self.apply_seeds(extracted, f"signalr:{target}", url, target_round_id=rid)
+
+        if target == "OnCrash":
+            value = None
+            for key in ("f", "multiplier", "coefficient", "crashPoint", "crash"):
+                value = as_float(payload.get(key))
+                if value is not None:
+                    break
+            if value is None:
+                return
+            eid = rid or event_id_for(payload, value, raw)
+            key = (eid, round(value, 6))
+            if key in self.seen_crashes:
+                return
+            self.seen_crashes.add(key)
+            if len(self.seen_crashes) > 8000:
+                self.seen_crashes.clear()
+            self.finish_round(eid, value, payload, url)
+
+        if target == "OnCrash":
+            log_network({
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "kind": "signalr_oncrash_keys",
+                "url": safe_url(url),
+                "keys": list(payload.keys()),
+                "payload": payload,
+            })
+
+    def _begin_round(self, rid: str, target: str) -> None:
+        old = self.current.get("id")
+        if old != rid:
+            self.current = {
+                "id": rid,
+                "phase": "betting" if target == "OnBetting" else "waiting",
+                "seed_hash": None,
+                "server_seed": None,
+                "client_seeds": [],
+                "combined_hash": None,
+                "nonce": None,
+                "multiplier": None,
+            }
+
+            # Apply only pending evidence explicitly belonging to this round.
+            pending_id = self.pending_commitment.get("round_id")
+            if self.pending_commitment and (pending_id in (None, rid)):
+                pending = dict(self.pending_commitment)
+                pending.pop("round_id", None)
+                pending.pop("explicit_round_id", None)
+                self.current = merge_seed_state(self.current, pending)
+                self.current["seed_sources"] = dict(pending.get("seed_sources") or {})
+                self.pending_commitment = {}
+        else:
+            self.current["phase"] = "betting" if target == "OnBetting" else self.current.get("phase") or "waiting"
+
+        self.flush_live(force_predict=target == "OnBetting")
+
+    def finish_round(self, round_id: str, multiplier: float, payload: dict, url: str, source: str = "websocket") -> None:
+        rid = str(round_id)
+
+        # OnCrash belongs to this exact round. If the active state belongs to a
+        # different round, start a clean state for the crash rather than mixing
+        # seed data across rounds.
+        if self.current.get("id") != rid:
+            self.current = {
+                "id": rid,
+                "phase": "flying",
+                "seed_hash": None,
+                "server_seed": None,
+                "client_seeds": [],
+                "combined_hash": None,
+                "nonce": None,
+                "multiplier": None,
+            }
+
+        extracted = extract_seed_fields(payload, short_ok=True)
+        self.current["id"] = rid
+        # Explicitly bind any seed material in the OnCrash payload to this round.
+        self.current = merge_seed_state(self.current, extracted)
+        self.current = self._merge_sources(self.current, extracted, "oncrash-payload")
+        self.current["multiplier"] = multiplier
+        self.current["phase"] = "crashed"
+
+        record = {
+            "id": rid,
+            "multiplier": multiplier,
+            "ts": payload.get("ts"),
+            "phase": "crashed",
+            "seed_hash": self.current.get("seed_hash"),
+            "server_seed": self.current.get("server_seed"),
+            "client_seeds": list(self.current.get("client_seeds") or []),
+            "combined_hash": self.current.get("combined_hash"),
+            "nonce": self.current.get("nonce"),
+            "seed_sources": self.current.get("seed_sources") or {},
+            "source": source,
+            "raw_keys": sorted(str(k) for k in payload.keys()),
+        }
+        record.update(verification_record(record))
+        saved = upsert_round(record)
+        self.last_round_id = rid
+        print(
+            f"[COLLECTOR] ROUND {rid} -> {multiplier:.2f}x source={source} seeds={_seed_summary(saved)}",
+            flush=True,
+        )
+
+        self.current = {
+            "id": None,
+            "phase": "waiting",
+            "seed_hash": None,
+            "server_seed": None,
+            "client_seeds": [],
+            "combined_hash": None,
+            "nonce": None,
+            "multiplier": None,
+        }
+        self.flush_live()
+
+    def ingest_generic(self, source: str, url: str, payload: Any, process_hex: bool = True) -> None:
+        raw = payload_text(payload)
+        if not raw:
+            return
+        for obj in json_candidates(raw):
+            if isinstance(obj, dict) and obj.get("target") in SIGNALR_TARGETS:
+                self.on_signalr(obj, raw, url)
+            else:
+                extracted = extract_seed_fields(obj, short_ok=False)
+                self.apply_seeds(extracted, source, url)
+                self._maybe_generic_crash(obj, raw, url)
+
+        # Only treat raw hex as evidence when seed/fair/nonce context is present.
+        if process_hex and re.search(r"(?i)seed|provably|fair|nonce|server.?seed|client.?seed", raw):
+            context_window = raw.lower()
+            hexes = extract_hex_from_text(context_window)
+            labeled = {
+                "seed_hash": [],
+                "server_seed": [],
+                "client_seeds": hexes.get("hex32") or [],
+                "combined_hash": hexes.get("hex128") or [],
+                "nonce": [],
+            }
+            for m in re.finditer(r"(?i)(seed.?hash|server.?seed.?hash|hash)", raw):
+                nearby = raw[m.start():m.start() + 250]
+                labeled["seed_hash"].extend(extract_hex_from_text(nearby).get("hex64") or [])
+            if labeled["seed_hash"] or labeled["combined_hash"] or labeled["client_seeds"]:
+                self.apply_seeds(labeled, source + ":hex", url)
+
+    @staticmethod
+    def _recursive_value(data: Any, keys: set[str], max_nodes: int = 1000):
+        """Find the first non-empty value whose normalized key matches one of keys."""
+        wanted = {re.sub(r"[^a-z0-9]", "", k.lower()) for k in keys}
+        stack = [data]
+        seen = set()
+        nodes = 0
+        while stack and nodes < max_nodes:
+            cur = stack.pop()
+            nodes += 1
+            if isinstance(cur, dict):
+                ident = id(cur)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                for k, v in cur.items():
+                    nk = re.sub(r"[^a-z0-9]", "", str(k).lower())
+                    if nk in wanted and v not in (None, "", [], {}):
+                        return v
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(cur, list):
+                stack.extend(reversed(cur[:200]))
+        return None
+
+    def ingest_sfs_event(self, event: dict, url: str) -> None:
+        if not isinstance(event, dict):
+            return
+
+        event_type = str(event.get("event_type") or "")
+        data = event.get("data") or {}
+        et = event_type.lower().replace("-", "_")
+        normalized_et = et.replace(" ", "_")
+
+        # V9: Spribe exposes a dedicated fairness response. In the observed
+        # stream it contains serverSeedSHA256 (the commitment/hash). Bind it
+        # to the explicit round when available, otherwise to the most recently
+        # completed round. Never infer a server seed from a multiplier.
+        if normalized_et == "servers
