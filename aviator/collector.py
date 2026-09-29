@@ -30,7 +30,7 @@ INJECT_JS = r"""
   const push = (item) => {
     try {
       window.__aviatorBuf.push(item);
-      if (window.__aviatorBuf.length > 2000) window.__aviatorBuf.splice(0, 1000);
+      if (window.__aviatorBuf.length > 200) window.__aviatorBuf.splice(0, 100);
     } catch (e) {}
   };
   const seen = new WeakSet();
@@ -163,11 +163,12 @@ class Collector:
     # --------------------------------------------------------------- frames
     def on_binary_frame(self, data: bytes, ws_url: str) -> None:
         received_at = time.time()
-        self._frame_index += 1
+        self._frame_index = getattr(self, "_frame_index", 0) + 1
         frame_index = self._frame_index
+        last_frame_received_at = getattr(self, "_last_frame_received_at", None)
         inter_arrival_ms = (
-            (received_at - self._last_frame_received_at) * 1000.0
-            if self._last_frame_received_at is not None else None
+            (received_at - last_frame_received_at) * 1000.0
+            if last_frame_received_at is not None else None
         )
         self._last_frame_received_at = received_at
         summary = binary_summary(data)

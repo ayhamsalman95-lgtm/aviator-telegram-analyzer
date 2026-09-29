@@ -15,6 +15,7 @@ Design guarantees
 """
 from __future__ import annotations
 
+import gc
 import time
 from collections import Counter
 from typing import Any, Optional
@@ -26,6 +27,7 @@ from .validation import RoundValidationError, parse_round_id
 IGNORED_COMMANDS = {"updatecurrentbets", "updatecurrentcashouts", "updatecurrentcashout",
                     "currentbetsinfo", "onlineplayers", "x", "pingresponse", "betsinfo"}
 STATE_NAMES = {1: "betting", 2: "flying", 3: "crashed"}
+COMPLETED_QUEUE_CLEANUP_EVERY = 200
 
 
 def _find_key(data: Any, wanted: str, depth: int = 3) -> Any:
@@ -55,6 +57,7 @@ class RoundTracker:
         self.counters: Counter = Counter()
         self.last_event_at: float = clock()
         self.completed_queue: list[int] = []
+        self._completed_since_cleanup = 0
 
     # ------------------------------------------------------------ helpers
     def _log(self, kind: str, **fields: Any) -> None:
@@ -68,6 +71,16 @@ class RoundTracker:
     def snapshot(self) -> dict:
         return {"current_round_id": self.current_round_id, "phase": self.phase,
                 "last_completed_id": self.last_completed_id, "counters": dict(self.counters)}
+
+    def _cleanup_completed_queue_if_due(self) -> None:
+        if self._completed_since_cleanup < COMPLETED_QUEUE_CLEANUP_EVERY:
+            return
+        # Fairness only needs to know that at least one completed round exists.
+        # Keep the newest id so the enabled autoclick path remains signaled.
+        if self.completed_queue:
+            self.completed_queue[:] = self.completed_queue[-1:]
+        self._completed_since_cleanup = 0
+        gc.collect()
 
     # ------------------------------------------------------------ dispatch
     def handle(self, cmd: Optional[str], params: Any, origin: str = "sfs") -> str:
@@ -106,6 +119,8 @@ class RoundTracker:
             rid = int(rid_raw)
             self.last_completed_id = max(rid, self.last_completed_id or 0)
             self.completed_queue.append(rid)
+            self._completed_since_cleanup += 1
+            self._cleanup_completed_queue_if_due()
             print(f"[SFS] ROUND_RESULT round_id={rid} maxMultiplier={float(mult_raw):.2f}x ({origin})",
                   flush=True)
         # Deliberately NOT touching current_round_id / state here.
@@ -201,8 +216,7 @@ class RoundTracker:
                 stored += self.store.add_fairness_evidence("commitment_sha256", rec.commitment, src, rid,
                                                            assoc, ctx)
             if rec.round_hash:
-                stored += self.store.add_fairness_evidence("round_hash_sha512", rec.round_hash, src, rid,
-                                                           assoc, ctx)
+                stored += self.store.add_fairness_evidence("round_hash_sha512", rec.round_hash, src, rid, assoc, ctx)
         if stored:
             self.counters["fairness:stored"] += stored
         return stored
