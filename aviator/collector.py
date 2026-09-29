@@ -30,7 +30,7 @@ INJECT_JS = r"""
   const push = (item) => {
     try {
       window.__aviatorBuf.push(item);
-      if (window.__aviatorBuf.length > 2000) window.__aviatorBuf.splice(0, 1000);
+      if (window.__aviatorBuf.length > 200) window.__aviatorBuf.splice(0, 100);
     } catch (e) {}
   };
   const seen = new WeakSet();
