@@ -43,6 +43,8 @@ async def main() -> None:
                 "--window-size=1440,900",
                 "--start-maximized",
                 "--remote-allow-origins=*",
+                "--renderer-process-limit=3",
+                "--in-process-gpu",
             ],
         )
 
@@ -50,7 +52,35 @@ async def main() -> None:
 
         async def attach_page(pg):
             try:
-                await pg.add_init_script(INJECT_JS)
+                await pg.add_init_script(r"""
+                (() => {
+                  const install = () => {
+                    try {
+                      const C = window.SFS2X && window.SFS2X.SmartFox;
+                      if (!C || !C.prototype || typeof C.prototype.dispatchEvent !== "function") return false;
+                      if (C.prototype.__aviatorMemoryGuard) return true;
+                      const orig = C.prototype.dispatchEvent;
+                      C.prototype.dispatchEvent = function(evt) {
+                        try {
+                          const type = String(evt && evt.type || "");
+                          const d = evt && evt.data;
+                          const cmd = d && (d.cmd || (d.params && d.params.cmd));
+                          if (type === "extensionResponse" && cmd === "updateCurrentBets") return;
+                        } catch (e) {}
+                        return orig.apply(this, arguments);
+                      };
+                      C.prototype.__aviatorMemoryGuard = true;
+                      return true;
+                    } catch (e) { return false; }
+                  };
+                  if (install()) return;
+                  let tries = 0;
+                  const timer = setInterval(() => {
+                    tries += 1;
+                    if (install() || tries > 240) clearInterval(timer);
+                  }, 500);
+                })();
+                """)
             except Exception:
                 pass
 
